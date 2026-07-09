@@ -343,6 +343,11 @@ func (m *Manager) joinWorkers(cluster, cp string, indices []int) error {
 // needs the guest to reach the network itself. A manifest URL is different:
 // kubectl fetches it from inside the guest, which fails. So this fetches
 // the manifest on the host (which does have internet) and pipes it in.
+// metricsServerPatch adds --kubelet-insecure-tls to the metrics-server
+// container args. Kept as a constant so the manual recovery command in the
+// error message below can never drift from what this actually runs.
+const metricsServerPatch = `[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]`
+
 func (m *Manager) installMetricsServer(cp string) error {
 	resp, err := httpx.Client.Get(metricsServerManifestURL)
 	if err != nil {
@@ -353,12 +358,31 @@ func (m *Manager) installMetricsServer(cp string) error {
 		return fmt.Errorf("fetching metrics-server manifest: HTTP %d", resp.StatusCode)
 	}
 	if err := m.rt.ExecStdin(cp, resp.Body, "kubectl", "--kubeconfig", adminConf, "apply", "-f", "-"); err != nil {
-		return err
+		return fmt.Errorf("applying metrics-server manifest: %w", err)
 	}
-	_, err = m.rt.Exec(cp, "kubectl", "--kubeconfig", adminConf,
-		"patch", "deployment", "metrics-server", "-n", "kube-system", "--type=json",
-		`-p=[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]`)
-	return err
+
+	// The patch is a separate API call right after apply and has been
+	// observed to fail transiently (e.g. apiserver momentarily unready)
+	// even though the apply immediately before it succeeded. Unlike apply,
+	// there's no visible symptom of a failed patch until metrics-server's
+	// readiness probe starts looping forever against kubelet certs it can't
+	// validate, so this is worth a few retries before giving up.
+	const attempts = 3
+	for attempt := 1; ; attempt++ {
+		_, err = m.rt.Exec(cp, "kubectl", "--kubeconfig", adminConf,
+			"patch", "deployment", "metrics-server", "-n", "kube-system", "--type=json",
+			"-p="+metricsServerPatch)
+		if err == nil {
+			return nil
+		}
+		if attempt == attempts {
+			return fmt.Errorf(
+				"patching metrics-server for --kubelet-insecure-tls after %d attempts (required: node kubelet serving certs here have no IP SANs, so metrics-server can't validate them without this flag): %w\n"+
+					"      fix manually with: kubectl --kubeconfig %s patch deployment metrics-server -n kube-system --type=json -p='%s'",
+				attempts, err, adminConf, metricsServerPatch)
+		}
+		time.Sleep(3 * time.Second)
+	}
 }
 
 // cleanup tears down partially-created node VMs so a failed Create never
