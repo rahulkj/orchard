@@ -15,12 +15,12 @@ the loop.
 
 - macOS on Apple silicon, with [`apple/container`](https://github.com/apple/container) installed
 - `kubectl`
-- Go 1.21+ (to build `orchard` itself)
+- Go (version pinned in `go.mod`, to build `orchard` itself)
 
 ```bash
 container system start                        # first-time init
 container system kernel set --recommended     # first-time init, if prompted
-go build -o orchard .
+make build
 ./orchard doctor
 ```
 
@@ -116,8 +116,10 @@ orchard self-update
 Checks GitHub releases for `rahulkj/orchard` (override with `--repo`) and
 replaces the running binary with the latest one. Expects a goreleaser-style
 release: an asset named `orchard_<os>_<arch>.tar.gz` containing an `orchard`
-binary. **Until this repo has a published release in that shape, this
-correctly reports "no releases found" — that's expected, not a bug.**
+binary. Releases in that shape are published automatically by
+`.github/workflows/release.yml` whenever a `v*` tag is pushed (see
+[Releasing](#releasing) below). Before the first tag, this correctly
+reports "no releases found" — that's expected, not a bug.
 
 ## CNI choice
 
@@ -215,3 +217,26 @@ portable mechanism this forwards.
 - Default node image is a `kindest/node` build pinned by digest (currently
   `v1.36.1`), verified to boot, reach `Ready`, and pass cross-node pod
   connectivity under this `apple/container` version.
+
+## Development
+
+```bash
+make build   # go build, version stamped via ldflags
+make check   # gofmt, go vet, golangci-lint, go test -race
+```
+
+`.github/workflows/ci.yml` runs the same checks on every push and pull
+request against `main`.
+
+## Releasing
+
+Pushing a `v*` tag (e.g. `v0.1.0`) triggers
+`.github/workflows/release.yml`, which runs
+[GoReleaser](https://goreleaser.com) (`.goreleaser.yaml`) to build
+`darwin/amd64` and `darwin/arm64` binaries, package them as
+`orchard_<os>_<arch>.tar.gz`, and publish them to a GitHub Release —
+the exact shape `orchard self-update` expects.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).

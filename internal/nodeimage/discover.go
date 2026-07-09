@@ -6,12 +6,20 @@ package nodeimage
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strconv"
+
+	"github.com/rahulkj/orchard/internal/httpx"
 )
 
-const firstPageURL = "https://hub.docker.com/v2/repositories/kindest/node/tags?page_size=100"
+// firstPageURL is overridden in tests to point at an httptest server.
+var firstPageURL = "https://hub.docker.com/v2/repositories/kindest/node/tags?page_size=100"
+
+// maxPages bounds pagination so a malformed or adversarial "next" link (e.g.
+// a self-referential loop) can't hang this in an infinite fetch loop. The
+// real tag list is ~2 pages at 100 tags/page; 50 pages (5000 tags) is far
+// more headroom than the repository will plausibly ever need.
+const maxPages = 50
 
 // Release is one discovered kindest/node build.
 type Release struct {
@@ -31,7 +39,10 @@ func Latest() (Release, error) {
 	var best Release
 	var bestV [3]int
 	url := firstPageURL
-	for url != "" {
+	for pages := 0; url != ""; pages++ {
+		if pages >= maxPages {
+			return Release{}, fmt.Errorf("querying Docker Hub for kindest/node tags: exceeded %d pages", maxPages)
+		}
 		var page struct {
 			Next    string `json:"next"`
 			Results []struct {
@@ -39,12 +50,12 @@ func Latest() (Release, error) {
 				Digest string `json:"digest"`
 			} `json:"results"`
 		}
-		resp, err := http.Get(url)
+		resp, err := httpx.Client.Get(url)
 		if err != nil {
 			return Release{}, fmt.Errorf("querying Docker Hub for kindest/node tags: %w", err)
 		}
 		err = func() error {
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != 200 {
 				return fmt.Errorf("querying Docker Hub for kindest/node tags: HTTP %d", resp.StatusCode)
 			}

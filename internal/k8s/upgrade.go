@@ -85,7 +85,15 @@ func (m *Manager) Upgrade(name, image string) (UpgradeResult, error) {
 		return UpgradeResult{}, fmt.Errorf("deleting old cluster: %w", err)
 	}
 	if err := m.Create(cfg); err != nil {
-		return UpgradeResult{}, fmt.Errorf("creating upgraded cluster (old cluster is already gone): %w", err)
+		// The old cluster's node VMs are already gone. Re-persist its state
+		// record (Delete removed it) so the settings aren't lost entirely,
+		// and hand the user the exact command to retry with.
+		if saveErr := state.Save(st); saveErr != nil {
+			fmt.Printf("warning: could not restore saved configuration for %q: %v\n", name, saveErr)
+		}
+		return UpgradeResult{}, fmt.Errorf(
+			"creating upgraded cluster (old cluster is already gone): %w\nretry with: orchard create --name %s --workers %d --image %s",
+			err, name, cfg.Workers, cfg.Image)
 	}
 	return UpgradeResult{FromVersion: from, ToVersion: to, Image: image, Changed: true}, nil
 }

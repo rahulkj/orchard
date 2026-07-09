@@ -5,6 +5,7 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -36,7 +37,26 @@ func dir() (string, error) {
 	return d, nil
 }
 
+// validName mirrors k8s.ValidName's character set (this package can't import
+// k8s: k8s already imports state). It's the one choke point every exported
+// function here routes through, so a name that hasn't been validated
+// upstream can't turn name+".json" into a path outside the clusters dir.
+func validName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if r != '-' && (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
 func path(name string) (string, error) {
+	if !validName(name) {
+		return "", fmt.Errorf("invalid cluster name %q", name)
+	}
 	d, err := dir()
 	if err != nil {
 		return "", err

@@ -2,7 +2,8 @@ package k8s
 
 import (
 	"fmt"
-	"net/http"
+
+	"github.com/rahulkj/orchard/internal/httpx"
 )
 
 const (
@@ -46,11 +47,11 @@ func (m *Manager) installCNI(cp, cni string) error {
 // have no general internet egress, so kubectl inside the guest can't fetch
 // a URL itself.
 func (m *Manager) applyManifestFromHost(cp, url string) error {
-	resp, err := http.Get(url)
+	resp, err := httpx.Client.Get(url)
 	if err != nil {
 		return fmt.Errorf("fetching %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("fetching %s: HTTP %d", url, resp.StatusCode)
 	}

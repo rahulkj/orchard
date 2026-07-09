@@ -5,7 +5,6 @@ package k8s
 
 import (
 	"fmt"
-	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rahulkj/orchard/internal/containerrt"
+	"github.com/rahulkj/orchard/internal/httpx"
 	"github.com/rahulkj/orchard/internal/state"
 )
 
@@ -117,12 +117,16 @@ func (m *Manager) Create(cfg CreateConfig) error {
 	if err := CheckNameLength(cfg.Name); err != nil {
 		return err
 	}
+	if cfg.Workers < 0 {
+		return fmt.Errorf("worker count cannot be negative")
+	}
 	if !validCNI(cfg.CNI) {
 		return fmt.Errorf("unknown --cni %q (supported: %v)", cfg.CNI, ValidCNIs)
 	}
-	if cfg.CNI == "flannel" {
+	switch cfg.CNI {
+	case "flannel":
 		fmt.Println("note: flannel is confirmed broken on the stock kindest/node image: its config delegates pod interface setup to the standard CNI \"bridge\" plugin, which the image does not ship (only kindnet's plugins are present). Pods will sit in ContainerCreating with \"failed to find plugin \\\"bridge\\\"\". Use kindnet (default) unless you know your node image ships /opt/cni/bin/bridge.")
-	} else if cfg.CNI == "calico" {
+	case "calico":
 		fmt.Println("note: calico is untested here. Its CNI plugin wires pod interfaces itself (unlike flannel, it does not delegate to the standard \"bridge\" plugin), so it may not hit the same failure flannel does, but it hasn't been verified against the default apple/container kernel/node image.")
 	}
 	cp := ControlPlane(cfg.Name)
@@ -340,11 +344,11 @@ func (m *Manager) joinWorkers(cluster, cp string, indices []int) error {
 // kubectl fetches it from inside the guest, which fails. So this fetches
 // the manifest on the host (which does have internet) and pipes it in.
 func (m *Manager) installMetricsServer(cp string) error {
-	resp, err := http.Get(metricsServerManifestURL)
+	resp, err := httpx.Client.Get(metricsServerManifestURL)
 	if err != nil {
 		return fmt.Errorf("fetching metrics-server manifest: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("fetching metrics-server manifest: HTTP %d", resp.StatusCode)
 	}

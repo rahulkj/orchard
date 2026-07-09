@@ -36,13 +36,20 @@ func rewriteAdminConf(cluster, adminConf, serverIP string) (clusterEntry, userEn
 		return nil, nil, nil, fmt.Errorf("admin.conf missing clusters or users")
 	}
 
-	clusterEntry, _ = clusters[0].(map[string]any)
+	var ok bool
+	clusterEntry, ok = clusters[0].(map[string]any)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("admin.conf cluster entry has unexpected shape")
+	}
 	if body, ok := clusterEntry["cluster"].(map[string]any); ok {
 		body["server"] = fmt.Sprintf("https://%s:6443", serverIP)
 	}
 	clusterEntry["name"] = entry
 
-	userEntry, _ = users[0].(map[string]any)
+	userEntry, ok = users[0].(map[string]any)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("admin.conf user entry has unexpected shape")
+	}
 	userEntry["name"] = entry
 
 	contextEntry = map[string]any{

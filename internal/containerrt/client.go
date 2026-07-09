@@ -4,12 +4,14 @@
 package containerrt
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,7 +19,8 @@ const Bin = "container"
 
 // Client wraps the container CLI. Zero value is usable.
 type Client struct {
-	capAdd *bool // cached probe result for --cap-add support
+	capAddOnce sync.Once
+	capAdd     bool // cached probe result for --cap-add support
 }
 
 // CmdError carries the captured output of a failed invocation.
@@ -32,12 +35,20 @@ func (e *CmdError) Error() string {
 	return fmt.Sprintf("container %s: %v\n%s", strings.Join(e.Args, " "), e.Err, out)
 }
 
+// run executes the container CLI and returns its stdout on success. Stdout
+// and stderr are captured separately so callers that parse stdout (e.g.
+// Exec, for reading a file or command output from inside a node) never see
+// stderr diagnostics mixed into the value they parse; on failure the error
+// carries both streams for diagnostics.
 func run(args ...string) (string, error) {
-	out, err := exec.Command(Bin, args...).CombinedOutput()
-	if err != nil {
-		return string(out), &CmdError{Args: args, Output: string(out), Err: err}
+	cmd := exec.Command(Bin, args...)
+	var stdout, combined bytes.Buffer
+	cmd.Stdout = io.MultiWriter(&stdout, &combined)
+	cmd.Stderr = &combined
+	if err := cmd.Run(); err != nil {
+		return combined.String(), &CmdError{Args: args, Output: combined.String(), Err: err}
 	}
-	return string(out), nil
+	return stdout.String(), nil
 }
 
 // Available reports whether the container binary is on PATH.
@@ -90,12 +101,11 @@ func (c *Client) RunDetached(spec NodeSpec) error {
 }
 
 func (c *Client) supportsCapAdd() bool {
-	if c.capAdd == nil {
+	c.capAddOnce.Do(func() {
 		out, _ := run("run", "--help")
-		v := strings.Contains(out, "--cap-add")
-		c.capAdd = &v
-	}
-	return *c.capAdd
+		c.capAdd = strings.Contains(out, "--cap-add")
+	})
+	return c.capAdd
 }
 
 // Exec runs a command inside a node and returns combined output.

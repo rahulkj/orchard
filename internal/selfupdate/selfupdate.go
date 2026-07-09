@@ -14,10 +14,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/rahulkj/orchard/internal/httpx"
 )
 
 // Release is a discovered GitHub release with an asset for this platform.
@@ -27,15 +28,24 @@ type Release struct {
 	AssetName string
 }
 
+// releaseAsset is one entry in a GitHub release's "assets" array.
+type releaseAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+// githubAPIBase is overridden in tests to point at an httptest server.
+var githubAPIBase = "https://api.github.com"
+
 // LatestRelease queries the GitHub API for repo's (owner/name) latest
 // release and finds the asset matching this platform.
 func LatestRelease(repo string) (Release, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
-	resp, err := http.Get(url)
+	url := fmt.Sprintf("%s/repos/%s/releases/latest", githubAPIBase, repo)
+	resp, err := httpx.Client.Get(url)
 	if err != nil {
 		return Release{}, fmt.Errorf("querying GitHub releases for %s: %w", repo, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == 404 {
 		return Release{}, fmt.Errorf("no releases found for %s (has this project been published with releases yet?)", repo)
 	}
@@ -44,23 +54,35 @@ func LatestRelease(repo string) (Release, error) {
 	}
 
 	var body struct {
-		TagName string `json:"tag_name"`
-		Assets  []struct {
-			Name               string `json:"name"`
-			BrowserDownloadURL string `json:"browser_download_url"`
-		} `json:"assets"`
+		TagName string         `json:"tag_name"`
+		Assets  []releaseAsset `json:"assets"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return Release{}, fmt.Errorf("parsing GitHub release response: %w", err)
 	}
 
-	want := fmt.Sprintf("orchard_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
-	for _, a := range body.Assets {
+	rel, ok := pickAsset(body.TagName, body.Assets, runtime.GOOS, runtime.GOARCH)
+	if !ok {
+		return Release{}, fmt.Errorf("release %s has no asset named %s for this platform", body.TagName, assetName(runtime.GOOS, runtime.GOARCH))
+	}
+	return rel, nil
+}
+
+func assetName(goos, goarch string) string {
+	return fmt.Sprintf("orchard_%s_%s.tar.gz", goos, goarch)
+}
+
+// pickAsset finds the release asset matching goos/goarch's goreleaser-style
+// name. Split out from LatestRelease so the matching logic can be tested
+// without a network call.
+func pickAsset(tag string, assets []releaseAsset, goos, goarch string) (Release, bool) {
+	want := assetName(goos, goarch)
+	for _, a := range assets {
 		if a.Name == want {
-			return Release{Tag: body.TagName, AssetURL: a.BrowserDownloadURL, AssetName: a.Name}, nil
+			return Release{Tag: tag, AssetURL: a.BrowserDownloadURL, AssetName: a.Name}, true
 		}
 	}
-	return Release{}, fmt.Errorf("release %s has no asset named %s for this platform", body.TagName, want)
+	return Release{}, false
 }
 
 // Apply downloads a release asset (a .tar.gz containing an `orchard`
@@ -68,11 +90,11 @@ func LatestRelease(repo string) (Release, error) {
 // it. The replacement file is created in the same directory as the running
 // binary so the final rename is on one filesystem and therefore atomic.
 func Apply(assetURL string) error {
-	resp, err := http.Get(assetURL)
+	resp, err := httpx.DownloadClient.Get(assetURL)
 	if err != nil {
 		return fmt.Errorf("downloading %s: %w", assetURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("downloading %s: HTTP %d", assetURL, resp.StatusCode)
 	}
@@ -81,7 +103,7 @@ func Apply(assetURL string) error {
 	if err != nil {
 		return fmt.Errorf("reading release archive: %w", err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 
 	tr := tar.NewReader(gz)
 	var bin []byte
@@ -113,14 +135,14 @@ func Apply(assetURL string) error {
 	if err != nil {
 		return fmt.Errorf("creating temp file next to %s: %w", exePath, err)
 	}
-	defer os.Remove(tmp.Name())
+	defer func() { _ = os.Remove(tmp.Name()) }()
 
 	if _, err := tmp.Write(bin); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("writing new binary: %w", err)
 	}
 	if err := tmp.Chmod(0o755); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
