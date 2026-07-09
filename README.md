@@ -11,23 +11,30 @@ issue](https://github.com/kubernetes/minikube/issues/20933), unimplemented).
 booted with `apple/container`, no third-party or unofficial dependency in
 the loop.
 
+## Install
+
+```bash
+brew install rahulkj/tap/orchard
+```
+
+Or build from source (see [Development](#development) below).
+
 ## Prerequisites
 
 - macOS on Apple silicon, with [`apple/container`](https://github.com/apple/container) installed
 - `kubectl`
-- Go (version pinned in `go.mod`, to build `orchard` itself)
+- Go (version pinned in `go.mod`, only needed if building from source)
 
 ```bash
 container system start                        # first-time init
 container system kernel set --recommended     # first-time init, if prompted
-make build
-./orchard doctor
+orchard doctor
 ```
 
 ## Quick start
 
 ```bash
-./orchard create --name dev --workers 2
+orchard create --name dev --workers 2
 kubectl get nodes -o wide      # Kubernetes view
 container list                 # apple/container view — same nodes, as VMs
 ```
@@ -234,8 +241,20 @@ Pushing a `v*` tag (e.g. `v0.1.0`) triggers
 `.github/workflows/release.yml`, which runs
 [GoReleaser](https://goreleaser.com) (`.goreleaser.yaml`) to build
 `darwin/amd64` and `darwin/arm64` binaries, package them as
-`orchard_<os>_<arch>.tar.gz`, and publish them to a GitHub Release —
-the exact shape `orchard self-update` expects.
+`orchard_<os>_<arch>.tar.gz`, publish them to a GitHub Release — the
+exact shape `orchard self-update` expects — and push an updated cask to
+[rahulkj/homebrew-tap](https://github.com/rahulkj/homebrew-tap).
+
+The Homebrew push needs a token with write access to that separate repo
+(the default `GITHUB_TOKEN` is scoped to this repo only). One-time setup:
+
+1. Create a fine-grained personal access token scoped to just
+   `rahulkj/homebrew-tap` with **Contents: read and write** permission
+   (Settings → Developer settings → Personal access tokens → Fine-grained
+   tokens).
+2. In this repo, add it as an Actions secret named
+   `HOMEBREW_TAP_GITHUB_TOKEN` (Settings → Secrets and variables →
+   Actions).
 
 ## License
 

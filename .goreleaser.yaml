@@ -29,6 +29,18 @@ archives:
 checksum:
   name_template: checksums.txt
 
+homebrew_casks:
+  - name: orchard
+    repository:
+      owner: rahulkj
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/rahulkj/orchard"
+    description: "Kubernetes clusters where every node is its own apple/container VM"
+    binaries:
+      - orchard
+
 changelog:
   sort: asc
   filters:
