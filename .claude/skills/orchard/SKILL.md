@@ -24,6 +24,7 @@ cd <this repo> && go build -o orchard .
 
 - `orchard create --name dev --workers 2 [--cni kindnet|flannel|calico] [--headlamp] [--proxy-forward] [--image ...] [--cp-cpus] [--cp-memory] [--worker-cpus] [--worker-memory] [--no-metrics] [--no-storage]`
 - `orchard scale --name dev --workers N` — up: boots+joins new workers reusing lowest free indices; down: drains + `kubectl delete node` + VM removal on highest-indexed workers first
+- `orchard stop --name dev` / `orchard start --name dev` — stop/start every node VM in place (no delete); `start` also repairs the IP-change fallout described below
 - `orchard delete --name dev` — removes node VMs, kubeconfig entries, and `~/.orchard/clusters/<name>.json` state
 - `orchard list` / `orchard doctor`
 - `orchard check-updates` / `orchard upgrade --name dev [--image] [--yes]` — upgrade is a **destroy-and-recreate**, not in-place (see below)
@@ -56,6 +57,48 @@ Full flag table and design rationale: `README.md` in this repo.
   check is flaky in this network environment and can return a version newer than what's
   baked into the image, forcing a network pull that fails on an untrusted certificate inside
   the guest. If you add another kubeadm-driven code path, pin the version the same way.
+- **`orchard stop`/`orchard start` (`internal/k8s/cluster.go`'s `Manager.Stop`/`Manager.Start`)
+  work around a real `kindest/node` bug, verified live by repeatedly stop/starting a running
+  2-worker cluster.** Node VMs get a fresh DHCP lease every boot. The image's own entrypoint
+  tries to handle that by regenerating the API server's serving cert via `kubeadm init phase
+  certs apiserver --config /kind/kubeadm.conf` — a file only `kind`'s own cluster tooling
+  writes; orchard's `kubeadm init` uses flags, not `--config`, so that file never exists here.
+  That command's failure, under the entrypoint's `set -o errexit`, kills the *entire* boot (the
+  VM lands back in `stopped`, not just delayed) — confirmed via `container logs` showing the
+  entrypoint dying right at `kubeadm init phase certs apiserver`. `startNode` retries the VM
+  boot itself (not just a readiness poll) a few times to ride this out; a bare `container start`
+  retry reliably recovers. Separately, that same entrypoint fixup only rewrites a node's
+  references to its *own* address (never a worker's reference to the control plane's address,
+  and never `admin.conf`/`super-admin.conf` at all) — confirmed by finding a worker's
+  `kubelet.conf` still pointing at the cluster's IP from creation time, hours and several
+  restarts later, while control-plane-local files were current. `repairAPIServerCert` and
+  `repointWorkerKubelet` fix these: regenerate the apiserver cert for the current IP, repoint
+  `admin.conf`/`super-admin.conf` and every worker's `kubelet.conf` at it, restart each worker's
+  kubelet. Don't remove these steps to "simplify" `Start` — without them the control plane
+  crash-loops or workers sit `NotReady` forever after any restart where the IP changed, which on
+  this host is effectively every restart.
+- **A fourth, distinct instance of the same bug class lives in the cluster-wide `kube-proxy`
+  ConfigMap, not on any node's disk** — confirmed live: after the three per-node fixes above,
+  nodes went `Ready` but CoreDNS sat forever logging `"Plugins not ready: kubernetes"`. Root
+  cause: `kube-proxy`'s ConfigMap (`kubeconfig.conf` key) bakes in the control plane's IP *at
+  kubeadm-init time* and nothing ever rewrites it on restart, since it's a Kubernetes API
+  object, not a file kind's boot-time sed script could touch. Stale kube-proxy can't reach the
+  API server at all, so it never programs a single Service iptables rule — confirmed via
+  `iptables -t nat -L` showing zero rules for `10.96.0.1` — which breaks every ClusterIP in the
+  cluster, not just `kubernetes`. That's the actual reason CoreDNS never becomes `Ready`: its
+  `kubernetes` plugin talks to the API through the ClusterIP. `repairKubeProxyConfig` fixes the
+  ConfigMap (piping `kubectl get cm -o yaml` through `sed` and back through `kubectl replace -f
+  -`, since that sidesteps JSON-escaping the multi-line value a strategic/JSON patch would need)
+  and bounces kube-proxy; `restartCoreDNS` separately force-deletes CoreDNS's pods because its
+  in-process client latches onto its first (broken) connection attempt and never recovers on
+  its own even once Service routing starts working again — confirmed live: fixing kube-proxy
+  alone left CoreDNS logging the same "not ready" message forever until its pods were bounced.
+  **Ordering matters**: both repairs run in `Start` only *after* every node VM is up. kube-proxy
+  is a DaemonSet spread across every node; deleting a pod whose node is still stopped wedges it
+  in `Terminating` forever waiting for a kubelet that isn't there to confirm it — this actually
+  happened once during development and hung the whole `orchard start` command for minutes. Both
+  deletes also pass `--wait=false` as a second, independent guard against that same hang class,
+  regardless of ordering.
 
 ## The guest-has-no-internet-egress pattern
 

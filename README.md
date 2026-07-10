@@ -78,6 +78,25 @@ Scaling up reuses the lowest free worker indices and the cluster's original
 first (`kubectl drain` + `kubectl delete node` + VM removal), so
 lower-numbered workers stay stable across resizes.
 
+### start / stop
+
+```bash
+orchard stop --name dev    # stops every node VM without deleting them
+orchard start --name dev   # boots them back up
+```
+
+`stop` shuts down the cluster's node VMs in place, leaving them (and the
+cluster's kubeconfig entries and saved state) untouched. `start` boots them
+back up, then repairs the things a fresh DHCP lease on the node VMs would
+otherwise break: it regenerates the API server's serving certificate for
+its new IP, repoints admin.conf/super-admin.conf and each worker's
+kubelet.conf at it, repoints the cluster-wide `kube-proxy` ConfigMap and
+restarts kube-proxy and CoreDNS, and refreshes the merged kubeconfig entry
+on the host. Without the `kube-proxy`/CoreDNS repair, Service ClusterIPs
+(including the one CoreDNS itself depends on) silently stop routing after
+any restart where the IP changed, leaving CoreDNS stuck `NotReady` and
+anything that depends on cluster DNS or a Service IP breaking with it.
+
 ### delete
 
 ```bash
@@ -224,6 +243,34 @@ portable mechanism this forwards.
 - Default node image is a `kindest/node` build pinned by digest (currently
   `v1.36.1`), verified to boot, reach `Ready`, and pass cross-node pod
   connectivity under this `apple/container` version.
+- **Node VMs get a fresh DHCP lease every boot, which breaks `kindest/node`'s
+  own IP-fixup on `orchard start`.** The image's entrypoint tries to
+  regenerate the API server's serving cert on an IP change via `kubeadm init
+  phase certs apiserver --config /kind/kubeadm.conf` — a file only `kind`'s
+  own tooling writes, never present here since `orchard create` runs
+  `kubeadm init` with flags, not `--config`. That failure, under the
+  entrypoint's `set -o errexit`, kills the whole boot outright (the VM ends
+  up back in `stopped`, not just delayed) — `orchard start` retries the VM
+  boot itself a few times to ride this out. The same fixup also only
+  rewrites a node's references to its *own* address, never a worker's
+  reference to the control plane's address, and never touches
+  `admin.conf`/`super-admin.conf` at all. Separately, the cluster-wide
+  `kube-proxy` ConfigMap bakes in the control plane's IP *at kubeadm-init
+  time* and is never touched by anything on any restart, since it's a
+  Kubernetes API object, not a node-local file a boot script could sed.
+  Left stale, kube-proxy can't reach the API server after a restart at all,
+  so it never programs a single Service iptables rule -- not just for
+  `kubernetes`, for every ClusterIP in the cluster -- which is what
+  actually leaves CoreDNS stuck `NotReady` forever (its `kubernetes` plugin
+  talks to the API through the in-cluster ClusterIP). `orchard start`
+  repairs all of this: regenerates the API server cert for the current IP,
+  repoints `admin.conf`/`super-admin.conf` and every worker's
+  `kubelet.conf` at it, restarts each worker's kubelet, repoints the
+  `kube-proxy` ConfigMap and restarts kube-proxy, and restarts CoreDNS
+  (whose in-process client latches onto its first, broken connection
+  attempt and won't recover on its own even after kube-proxy is fixed). See
+  `repairAPIServerCert`, `repointWorkerKubelet`, `repairKubeProxyConfig`,
+  and `restartCoreDNS` in `internal/k8s/cluster.go`.
 
 ## Development
 

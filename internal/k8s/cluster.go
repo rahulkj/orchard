@@ -432,6 +432,289 @@ func (m *Manager) Delete(cluster string) error {
 	return nil
 }
 
+// Stop stops every node VM for a cluster without deleting them or their
+// saved state, so a later Start resumes the same cluster. Workers stop
+// first so their kubelets never have to notice the control plane vanish
+// out from under them mid-shutdown.
+func (m *Manager) Stop(cluster string) error {
+	cp, workers, err := m.clusterNodes(cluster)
+	if err != nil {
+		return err
+	}
+	if len(workers) > 0 {
+		if err := step(fmt.Sprintf("stopping %d worker node VM(s)", len(workers)), func() error {
+			return containerrt.Stop(workers...)
+		}); err != nil {
+			return err
+		}
+	}
+	if err := step("stopping control-plane node VM", func() error {
+		return containerrt.Stop(cp)
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("cluster %q stopped. resume it with: orchard start --name %s\n", cluster, cluster)
+	return nil
+}
+
+// Start boots every node VM for a cluster back up after Stop. The control
+// plane starts first and must be ready before workers start, mirroring the
+// dependency workers already have on it at join time.
+func (m *Manager) Start(cluster string) error {
+	cp, workers, err := m.clusterNodes(cluster)
+	if err != nil {
+		return err
+	}
+	if err := step("starting control-plane node VM", func() error {
+		return m.startNode(cp)
+	}); err != nil {
+		return err
+	}
+
+	var cpIP string
+	if err := step("repairing API server certificate for current IP", func() error {
+		cpIP, err = m.repairAPIServerCert(cp)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	if err := step("waiting for the API server to accept connections", func() error {
+		return m.waitForAPIServer(cp, 60*time.Second)
+	}); err != nil {
+		return err
+	}
+
+	if len(workers) > 0 {
+		if err := step(fmt.Sprintf("starting %d worker node VM(s)", len(workers)), func() error {
+			return inParallel(len(workers), func(i int) error {
+				if err := m.startNode(workers[i]); err != nil {
+					return err
+				}
+				return m.repointWorkerKubelet(workers[i], cpIP)
+			})
+		}); err != nil {
+			return err
+		}
+	}
+
+	if err := step("waiting for nodes to be Ready", func() error {
+		_, err := m.rt.Exec(cp, "kubectl", "--kubeconfig", adminConf,
+			"wait", "--for=condition=Ready", "nodes", "--all", "--timeout=120s")
+		return err
+	}); err != nil {
+		return err
+	}
+
+	if err := step("repairing kube-proxy and CoreDNS for current IP", func() error {
+		if err := m.repairKubeProxyConfig(cp, cpIP); err != nil {
+			return err
+		}
+		return m.restartCoreDNS(cp)
+	}); err != nil {
+		return err
+	}
+
+	// The control plane's DHCP-assigned IP can change across a stop/start
+	// cycle (apple/container VMs re-lease on boot), so the kubeconfig
+	// server address written at create time can go stale here even though
+	// nothing about the cluster itself changed.
+	var kubeconfigPath string
+	if err := step("refreshing kubeconfig", func() error {
+		raw, err := m.rt.Exec(cp, "cat", adminConf)
+		if err != nil {
+			return err
+		}
+		ip, err := m.rt.IP(cp)
+		if err != nil {
+			return err
+		}
+		kubeconfigPath, err = MergeKubeconfig(cluster, raw, ip)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	fmt.Printf("cluster %q started.\n", cluster)
+	fmt.Printf("context orchard-%s refreshed in %s\n", cluster, kubeconfigPath)
+	fmt.Println("  kubectl get nodes")
+	return nil
+}
+
+// startNode starts a stopped node VM and waits for it to come up, retrying
+// the boot itself (not just the readiness poll) a few times. The
+// kindest/node image's entrypoint runs with `set -o errexit`, and its own
+// IP-fixup logic (see repairAPIServerCert) reliably fails one of its steps
+// on the DHCP lease change a restart usually brings -- which kills the
+// entrypoint and leaves the whole VM back in the stopped state before
+// systemd ever starts, rather than merely delaying it. A bare retry of
+// `container start` has reliably recovered from this in testing, so retry
+// here instead of surfacing the flake to the caller.
+func (m *Manager) startNode(name string) error {
+	const attempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := containerrt.Start(name); err != nil {
+			lastErr = err
+			continue
+		}
+		if err := m.rt.WaitReady(name, 60*time.Second); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("node %s did not come up after %d attempts: %w", name, attempts, lastErr)
+}
+
+// waitForAPIServer polls until the API server answers on the control
+// plane's admin.conf. Regenerating the serving certificate (see
+// repairAPIServerCert) only replaces the file on disk; kube-apiserver keeps
+// crash-looping against the old (now-replaced) cert for however long it
+// takes kubelet's backoff to cycle it again, so callers that need the API
+// server up -- kube-proxy/CoreDNS repair, "wait for nodes Ready" -- must
+// wait for it explicitly rather than assuming the cert fix alone is enough.
+func (m *Manager) waitForAPIServer(cp string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if _, err := m.rt.Exec(cp, "kubectl", "--kubeconfig", adminConf, "get", "--raw", "/healthz"); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("API server on %s never became reachable: %w", cp, lastErr)
+}
+
+// repairAPIServerCert regenerates the API server's serving certificate for
+// the control plane's current IP and repoints admin.conf/super-admin.conf
+// at it. Node VMs get a fresh DHCP lease on every boot, and the
+// kindest/node image's own boot-time IP-fixup script deletes the old
+// apiserver cert whenever the IP changed but can't regenerate it: its
+// regeneration path shells out to `kubeadm init phase certs apiserver
+// --config /kind/kubeadm.conf`, a file only kind's own cluster tooling
+// writes -- orchard runs kubeadm init with flags, not --config, so that
+// file never exists here. Left alone, kube-apiserver crash-loops forever on
+// the missing cert file. That same fixup script also rewrites the server
+// address in controller-manager.conf/scheduler.conf/kubelet.conf (so the
+// control plane's own components can reach it) but deliberately leaves
+// admin.conf/super-admin.conf alone, so every in-guest `kubectl --kubeconfig
+// admin.conf` call this package makes elsewhere would otherwise keep
+// dialing a dead IP forever after the first restart. Both the cert phase
+// and the sed are no-ops if nothing actually changed, so running this
+// unconditionally on every Start is safe. Returns the control plane's
+// current IP so the caller can also repoint workers at it (see
+// repointWorkerKubelet).
+func (m *Manager) repairAPIServerCert(cp string) (string, error) {
+	ip, err := m.rt.IP(cp)
+	if err != nil {
+		return "", err
+	}
+	version, err := m.nodeKubernetesVersion(cp)
+	if err != nil {
+		return "", err
+	}
+	if _, err := m.rt.Exec(cp, "kubeadm", "init", "phase", "certs", "apiserver",
+		"--apiserver-advertise-address="+ip,
+		"--apiserver-cert-extra-sans="+ip,
+		"--kubernetes-version="+version); err != nil {
+		return "", err
+	}
+	sed := fmt.Sprintf(
+		`for f in %s /etc/kubernetes/super-admin.conf; do [ -f "$f" ] && sed -i -E 's#server: https://[0-9.]+:6443#server: https://%s:6443#' "$f"; done`,
+		adminConf, ip)
+	if _, err := m.rt.Exec(cp, "sh", "-c", sed); err != nil {
+		return "", err
+	}
+	return ip, nil
+}
+
+// repointWorkerKubelet rewrites a worker's kubelet.conf to dial the control
+// plane's current IP and restarts kubelet to pick it up. kind's own
+// boot-time IP-fixup script only rewrites a node's references to its *own*
+// address; a worker's kubelet.conf points at the control plane's address,
+// which from the worker's perspective never changes as far as that script
+// can tell, so it's left holding whatever IP was current back when the
+// worker first joined -- forever, across every future restart where the
+// control plane's IP moves. Left alone, the worker's kubelet can never
+// register and the node sits NotReady indefinitely.
+func (m *Manager) repointWorkerKubelet(worker, cpIP string) error {
+	sed := fmt.Sprintf(
+		`sed -i -E 's#server: https://[0-9.]+:6443#server: https://%s:6443#' /etc/kubernetes/kubelet.conf && systemctl restart kubelet`,
+		cpIP)
+	_, err := m.rt.Exec(worker, "sh", "-c", sed)
+	return err
+}
+
+// repairKubeProxyConfig repoints the cluster-wide kube-proxy ConfigMap at
+// the control plane's current IP and bounces kube-proxy so it picks it up.
+// Unlike the per-node repairs above, this isn't a file on any node's disk --
+// it's baked into a Kubernetes object (the "kube-proxy" ConfigMap in
+// kube-system) at kubeadm-init time and nothing about a node reboot rewrites
+// API objects, so it's left holding the ORIGINAL cluster-creation IP
+// forever. Left alone, kube-proxy can't reach the API server at all after a
+// restart, so it never programs a single Service iptables rule -- not just
+// for "kubernetes", for every ClusterIP in the cluster. That's what actually
+// leaves CoreDNS stuck NotReady after a restart: its "kubernetes" plugin
+// talks to the API through the in-cluster ClusterIP (10.96.0.1), which has
+// silently had zero routing since boot. Piping the ConfigMap's full YAML
+// through sed (rather than a JSON/strategic patch) sidesteps having to
+// JSON-escape the multi-line kubeconfig.conf value while still preserving
+// every other key untouched.
+//
+// Called only after every node VM is back up (Start runs this after
+// starting workers, not before): kube-proxy's pods are a DaemonSet spread
+// across every node, and deleting one whose node is still stopped leaves it
+// wedged in Terminating forever waiting for a kubelet that isn't there to
+// confirm it -- --wait=false additionally guards against that regardless of
+// ordering, since kubectl would otherwise block the whole exec on that
+// confirmation.
+func (m *Manager) repairKubeProxyConfig(cp, ip string) error {
+	script := fmt.Sprintf(
+		`kubectl --kubeconfig %s get configmap kube-proxy -n kube-system -o yaml `+
+			`| sed -E 's#server: https://[0-9.]+:6443#server: https://%s:6443#' `+
+			`| kubectl --kubeconfig %s replace -f - `+
+			`&& kubectl --kubeconfig %s delete pods -n kube-system -l k8s-app=kube-proxy --ignore-not-found --wait=false`,
+		adminConf, ip, adminConf, adminConf)
+	_, err := m.rt.Exec(cp, "sh", "-c", script)
+	return err
+}
+
+// restartCoreDNS force-deletes CoreDNS's pods so they reconnect fresh.
+// CoreDNS's "kubernetes" plugin latches onto its first (broken, pre-
+// repairKubeProxyConfig) connection attempt and never recovers on its own
+// even once Service routing starts working again -- verified live: after
+// fixing kube-proxy alone, CoreDNS sat logging "Plugins not ready:
+// kubernetes" indefinitely; only a pod restart cleared it. --wait=false for
+// the same reason as repairKubeProxyConfig: don't let this block on a node
+// that isn't fully up yet.
+func (m *Manager) restartCoreDNS(cp string) error {
+	_, err := m.rt.Exec(cp, "kubectl", "--kubeconfig", adminConf,
+		"delete", "pods", "-n", "kube-system", "-l", "k8s-app=kube-dns", "--ignore-not-found", "--wait=false")
+	return err
+}
+
+// clusterNodes returns a cluster's control-plane name and its worker names,
+// erroring if the cluster has no node VMs at all.
+func (m *Manager) clusterNodes(cluster string) (cp string, workers []string, err error) {
+	nodes, err := containerrt.List(prefix(cluster))
+	if err != nil {
+		return "", nil, err
+	}
+	if len(nodes) == 0 {
+		return "", nil, fmt.Errorf("no cluster named %q found", cluster)
+	}
+	cp = ControlPlane(cluster)
+	for _, n := range nodes {
+		if n.Name != cp {
+			workers = append(workers, n.Name)
+		}
+	}
+	return cp, workers, nil
+}
+
 // Clusters lists cluster names derived from running orchard- containers.
 func Clusters() ([]string, error) {
 	nodes, err := containerrt.List("orchard-")

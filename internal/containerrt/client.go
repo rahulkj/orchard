@@ -237,6 +237,22 @@ func firstString(m map[string]any, paths ...string) string {
 	return ""
 }
 
+// Start boots an already-created (stopped) node VM back up. Unlike Stop,
+// the container CLI's `start` only accepts one container ID at a time.
+func Start(name string) error {
+	_, err := run("start", name)
+	return err
+}
+
+// Stop stops one or more running node VMs without deleting them.
+func Stop(names ...string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	_, err := run(append([]string{"stop"}, names...)...)
+	return err
+}
+
 // Remove force-deletes containers, ignoring not-found errors.
 func Remove(names ...string) error {
 	if len(names) == 0 {
