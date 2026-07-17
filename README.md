@@ -59,8 +59,8 @@ Flags:
 |---|---|---|
 | `--workers` | `2` | `0` gives a single untainted node |
 | `--image` | pinned `kindest/node` digest | override to pin a different Kubernetes version |
-| `--cp-cpus` / `--cp-memory` | `4` / `4096M` | control-plane VM sizing |
-| `--worker-cpus` / `--worker-memory` | `4` / `2048M` | per-worker VM sizing |
+| `--cp-cpus` / `--cp-memory` | `2` / `3072M` | control-plane VM sizing |
+| `--worker-cpus` / `--worker-memory` | `4` / `4096M` | per-worker VM sizing |
 | `--cni` | `kindnet` | see [CNI choice](#cni-choice) below |
 | `--no-metrics` / `--no-storage` | off | skip those addons |
 | `--headlamp` | off | install the [Headlamp](#headlamp) web UI |
@@ -271,6 +271,21 @@ portable mechanism this forwards.
   attempt and won't recover on its own even after kube-proxy is fixed). See
   `repairAPIServerCert`, `repointWorkerKubelet`, `repairKubeProxyConfig`,
   and `restartCoreDNS` in `internal/k8s/cluster.go`.
+- **Default VM sizing puts more memory on workers than the control plane, not the other way
+  around** — measured live on a 2-worker cluster via `container stats` and a `/dev/shm` memory
+  stress test. At idle, the control plane's own components (etcd, apiserver,
+  controller-manager, scheduler) plus whatever addon pods land there (CoreDNS and
+  local-path-provisioner reliably schedule onto the control plane in practice, since it reaches
+  `Ready` before workers finish joining and their pods tolerate the control-plane taint) used
+  ~1.6-1.8GB regardless of which CP memory size was configured. 2048M left only ~200-400MB
+  headroom (too tight once real API load adds up); 3072M settled at a comfortable ~55-60%
+  utilized and stayed stable through 50 rapid-fire object creations. Workers, by contrast, only
+  need ~650-700MB for kubelet/kube-proxy/kindnet at idle — the rest of whatever they're
+  allocated is headroom for whatever you actually deploy to test. Verified a worker configured
+  at 4096M can genuinely absorb a ~3GB memory workload without kubelet/containerd hiccuping. If
+  you tune these further, don't shrink the control plane below ~2.5-3GB without re-measuring —
+  addon-pod placement onto the control plane isn't something orchard's `Create` currently
+  prevents.
 
 ## Development
 

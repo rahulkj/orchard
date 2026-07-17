@@ -24,7 +24,7 @@ func (c *ScaleConfig) applyDefaults() {
 		c.WorkerCPUs = "4"
 	}
 	if c.WorkerMem == "" {
-		c.WorkerMem = "2048M"
+		c.WorkerMem = "4096M"
 	}
 	if c.WaitTimeout == 0 {
 		c.WaitTimeout = 180 * time.Second

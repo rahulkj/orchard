@@ -47,16 +47,16 @@ func (c *CreateConfig) applyDefaults() {
 		c.Image = DefaultImage
 	}
 	if c.CPCPUs == "" {
-		c.CPCPUs = "4"
+		c.CPCPUs = "2"
 	}
 	if c.CPMemory == "" {
-		c.CPMemory = "4096M"
+		c.CPMemory = "3072M"
 	}
 	if c.WorkerCPUs == "" {
 		c.WorkerCPUs = "4"
 	}
 	if c.WorkerMem == "" {
-		c.WorkerMem = "2048M"
+		c.WorkerMem = "4096M"
 	}
 	if c.CNI == "" {
 		c.CNI = "kindnet"

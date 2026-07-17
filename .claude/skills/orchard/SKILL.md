@@ -142,3 +142,20 @@ at a loopback port a guest VM can't reach anyway, and evaluating a PAC script ne
 - `internal/containerrt` is the only package that shells out to the `container` CLI — route
   any new apple/container interaction through it rather than calling `exec.Command("container",
   ...)` elsewhere.
+- **Default VM sizing (`CreateConfig.applyDefaults` in `internal/k8s/cluster.go`, mirrored in
+  `ScaleConfig.applyDefaults` in `internal/k8s/scale.go` for new workers) is control plane 2
+  vCPU/3072M, worker 4 vCPU/4096M each — control plane gets *less* memory than each worker,
+  deliberately.** Measured live via `container stats` + a `/dev/shm` memory-stress test: the
+  control plane's fixed overhead (etcd/apiserver/controller-manager/scheduler, plus CoreDNS and
+  local-path-provisioner, which reliably land there since it's `Ready` before workers finish
+  joining and their pods tolerate the control-plane taint) sits at ~1.6-1.8GB regardless of
+  configured size and doesn't grow with workload size — 2048M left it dangerously tight
+  (~85-90% utilized at idle), 3072M settled at a comfortable ~55-60%. Workers only need
+  ~650-700MB for kubelet/kube-proxy/kindnet; everything past that is headroom for whatever gets
+  deployed to test, which is the entire point of a local dev cluster. Don't "fix" this back
+  toward equal or CP-heavy sizing without re-measuring — that was the bug being corrected.
+  `scale.go`'s worker default must stay in sync with `create`'s worker default (both currently
+  4096M) or `orchard scale` without explicit `--worker-memory` silently adds workers sized
+  differently from the rest of the cluster; note that `scale` doesn't consult the cluster's
+  saved `state.Cluster.WorkerMem` at all currently, only its own hardcoded default or an
+  explicit flag — a pre-existing gap, not introduced by this sizing change.

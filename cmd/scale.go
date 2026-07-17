@@ -21,7 +21,7 @@ func init() {
 	c.Flags().IntVar(&cfg.Workers, "workers", 0, "desired worker count")
 	c.Flags().StringVar(&cfg.Image, "image", "", "image for newly added workers (default: same as control plane)")
 	c.Flags().StringVar(&cfg.WorkerCPUs, "worker-cpus", "", "vCPUs for newly added workers (default 4)")
-	c.Flags().StringVar(&cfg.WorkerMem, "worker-memory", "", "memory for newly added workers (default 2048M)")
+	c.Flags().StringVar(&cfg.WorkerMem, "worker-memory", "", "memory for newly added workers (default 4096M)")
 	_ = c.MarkFlagRequired("workers")
 	rootCmd.AddCommand(c)
 }
