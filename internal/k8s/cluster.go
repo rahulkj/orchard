@@ -506,8 +506,11 @@ func (m *Manager) Start(cluster string) error {
 		return err
 	}
 
-	if err := step("repairing kube-proxy and CoreDNS for current IP", func() error {
+	if err := step("repairing kube-proxy, cluster-info, and CoreDNS for current IP", func() error {
 		if err := m.repairKubeProxyConfig(cp, cpIP); err != nil {
+			return err
+		}
+		if err := m.repairClusterInfoConfig(cp, cpIP); err != nil {
 			return err
 		}
 		return m.restartCoreDNS(cp)
@@ -678,6 +681,26 @@ func (m *Manager) repairKubeProxyConfig(cp, ip string) error {
 			`| kubectl --kubeconfig %s replace -f - `+
 			`&& kubectl --kubeconfig %s delete pods -n kube-system -l k8s-app=kube-proxy --ignore-not-found --wait=false`,
 		adminConf, ip, adminConf, adminConf)
+	_, err := m.rt.Exec(cp, "sh", "-c", script)
+	return err
+}
+
+// repairClusterInfoConfig repoints the cluster-info ConfigMap (kube-public)
+// at the control plane's current IP. kubeadm writes this ConfigMap at init
+// time with the original advertise address baked in, and it is never touched
+// by any node reboot. Left stale, `kubeadm join` (used by orchard scale)
+// fails to fetch cluster configuration from the dead address even though the
+// join command itself dials a current one -- breaking scale-up after any
+// restart where the control plane's IP moved. Tolerant of a missing
+// ConfigMap (older clusters) so a missing object never fails Start.
+func (m *Manager) repairClusterInfoConfig(cp, ip string) error {
+	script := fmt.Sprintf(
+		`if kubectl --kubeconfig %s get configmap cluster-info -n kube-public >/dev/null 2>&1; then `+
+			`kubectl --kubeconfig %s get configmap cluster-info -n kube-public -o yaml `+
+			`| sed -E 's#server: https://[0-9.]+:6443#server: https://%s:6443#' `+
+			`| kubectl --kubeconfig %s replace -f -; `+
+			`fi`,
+		adminConf, adminConf, ip, adminConf)
 	_, err := m.rt.Exec(cp, "sh", "-c", script)
 	return err
 }
